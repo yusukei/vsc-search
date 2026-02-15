@@ -518,7 +518,11 @@
     });
     els.dirInput.addEventListener("input", function () {
       state.directory = els.dirInput.value;
-      triggerSearch();
+      clearSearchState();
+      els.searchInput.value = "";
+      renderResults();
+      renderPreviewEmpty();
+      updateHitCount();
     });
     els.dirInput.addEventListener("keydown", onKeyDown);
     dirRow.appendChild(els.dirInput);
@@ -532,7 +536,11 @@
         if (folder) {
           state.directory = folder;
           els.dirInput.value = folder;
-          triggerSearch();
+          clearSearchState();
+          els.searchInput.value = "";
+          renderResults();
+          renderPreviewEmpty();
+          updateHitCount();
         }
       });
     });
@@ -577,12 +585,31 @@
   // Show / Hide
   // ---------------------------------------------------------------------------
 
+  function clearSearchState() {
+    state.query = "";
+    state.results = [];
+    state.selectedIndex = 0;
+    state.fileCount = 0;
+    state.totalHits = 0;
+    state.truncated = false;
+    state.previewCache = {};
+    if (searchTimer) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+  }
+
   function showModal(args) {
     if (!els.modal) return;
 
-    if (args && args.directory != null) {
+    var dirChanged = false;
+    if (args && args.directory != null && args.directory !== state.directory) {
       state.directory = args.directory;
-      els.dirInput.value = args.directory;
+      dirChanged = true;
+    }
+
+    if (dirChanged) {
+      clearSearchState();
     }
 
     els.backdrop.style.display = "block";
@@ -595,17 +622,18 @@
     els.toggleW.classList.toggle("active", state.wholeWord);
     els.toggleRx.classList.toggle("active", state.useRegex);
 
+    renderResults();
+    updateHitCount();
+    if (state.results.length > 0) {
+      loadPreview();
+    } else {
+      renderPreviewEmpty();
+    }
+
     setTimeout(function () {
       els.searchInput.focus();
       els.searchInput.select();
     }, 0);
-
-    if (state.results.length > 0) {
-      renderResults();
-      loadPreview();
-    } else if (state.query) {
-      triggerSearch();
-    }
   }
 
   function hideModal() {
