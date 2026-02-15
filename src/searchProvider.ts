@@ -21,13 +21,32 @@ export class SearchProvider {
       workspaceFolder,
       searchDir ? `${searchDir}/**/*` : "**/*"
     );
+
+    const defaultExcludes = [
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/.DS_Store",
+    ];
+    // If the user explicitly targets an excluded directory, remove that exclusion
+    const excludes = searchDir
+      ? defaultExcludes.filter((pattern) => {
+          const dir = pattern.replace(/^\*\*\//, "").replace(/\/\*\*$/, "");
+          return !searchDir.startsWith(dir) && !searchDir.includes("/" + dir);
+        })
+      : defaultExcludes;
     const excludePattern =
-      "{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/.DS_Store}";
+      excludes.length > 0 ? `{${excludes.join(",")}}` : undefined;
+
+    console.log(`[vsc-search] search: query="${params.query}", dir="${searchDir}", glob="${searchDir ? `${searchDir}/**/*` : "**/*"}", exclude=${excludePattern}`);
 
     const uris = await vscode.workspace.findFiles(globPattern, excludePattern);
+    console.log(`[vsc-search] findFiles returned ${uris.length} URIs`);
 
     const regex = this.buildRegex(params);
     if (!regex) {
+      console.log("[vsc-search] regex build failed");
       return { results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0 };
     }
 

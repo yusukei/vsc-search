@@ -1,4 +1,5 @@
 src/**
+injected/**
 node_modules/**
 .vscode/**
 tsconfig.json
