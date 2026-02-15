@@ -117,6 +117,49 @@ function removeFastPathJson(injectDir: string, windowId: number): void {
   } catch {}
 }
 
+// --- Explorer selection detection (clipboard workaround) ---
+
+async function getExplorerSelection(): Promise<vscode.Uri | undefined> {
+  try {
+    // Save current clipboard content
+    const savedClipboard = await vscode.env.clipboard.readText();
+
+    // Use a unique marker to detect if copyFilePath actually copied something
+    const marker = `__vsc_search_marker_${Date.now()}__`;
+    await vscode.env.clipboard.writeText(marker);
+
+    // Execute copyFilePath — copies the focused explorer item's path
+    await vscode.commands.executeCommand("copyFilePath");
+
+    // Read what was copied
+    const copiedPath = await vscode.env.clipboard.readText();
+
+    // Restore original clipboard
+    await vscode.env.clipboard.writeText(savedClipboard);
+
+    // If clipboard still has our marker, nothing was copied
+    if (!copiedPath || copiedPath === marker) {
+      return undefined;
+    }
+
+    const uri = vscode.Uri.file(copiedPath);
+
+    // Check if it's a directory or file
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type & vscode.FileType.Directory) {
+        return uri;
+      }
+      // If it's a file, use its parent directory
+      return vscode.Uri.joinPath(uri, "..");
+    } catch {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 // --- Activation ---
 
 export function activate(context: vscode.ExtensionContext) {
@@ -322,8 +365,23 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        const directory = uri
-          ? vscode.workspace.asRelativePath(uri)
+        let targetUri = uri;
+
+        // If no URI from context menu (keyboard shortcut), try to get explorer selection
+        if (!targetUri) {
+          targetUri = await getExplorerSelection();
+        }
+
+        // Fallback to active editor's parent directory
+        if (!targetUri) {
+          const activeEditor = vscode.window.activeTextEditor;
+          if (activeEditor && !activeEditor.document.isUntitled) {
+            targetUri = vscode.Uri.joinPath(activeEditor.document.uri, "..");
+          }
+        }
+
+        const directory = targetUri
+          ? vscode.workspace.asRelativePath(targetUri)
           : undefined;
 
         if (!bridge?.isConnected) {

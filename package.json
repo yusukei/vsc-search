@@ -43,8 +43,8 @@
     "keybindings": [
       {
         "command": "vsc-search.searchInDirectory",
-        "key": "ctrl+alt+f",
-        "mac": "cmd+alt+f"
+        "key": "ctrl+shift+f",
+        "mac": "cmd+shift+f"
       }
     ]
   },
