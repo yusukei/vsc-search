@@ -1,0 +1,57 @@
+{
+  "name": "vsc-search",
+  "displayName": "vsc-search",
+  "description": "Find in Files with floating modal UI",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vsc-search.searchInDirectory",
+        "title": "Search in Directory",
+        "category": "vsc-search"
+      },
+      {
+        "command": "vsc-search.enablePatch",
+        "title": "Enable (Patch VS Code)",
+        "category": "vsc-search"
+      },
+      {
+        "command": "vsc-search.disablePatch",
+        "title": "Disable (Restore VS Code)",
+        "category": "vsc-search"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "vsc-search.searchInDirectory",
+          "when": "explorerResourceIsFolder",
+          "group": "4_search"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "vsc-search.searchInDirectory",
+        "key": "ctrl+alt+f",
+        "mac": "cmd+alt+f"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}

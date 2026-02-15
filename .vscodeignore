@@ -1,0 +1,9 @@
+src/**
+node_modules/**
+.vscode/**
+tsconfig.json
+esbuild.mjs
+vsc-search-spec.md
+vsc-search-mock.jsx
+DEVELOPMENT_PLAN.md
+*.map
