@@ -48,6 +48,7 @@
       }
     ]
   },
+  "license": "MIT",
   "publisher": "vtechstudio",
   "scripts": {
     "build": "node esbuild.mjs",
