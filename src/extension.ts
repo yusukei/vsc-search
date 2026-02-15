@@ -163,7 +163,9 @@ async function getExplorerSelection(): Promise<vscode.Uri | undefined> {
 // --- Activation ---
 
 export function activate(context: vscode.ExtensionContext) {
-  const searchProvider = new SearchProvider();
+  const workerPath = path.join(context.extensionPath, "dist", "searchWorker.js");
+  const searchProvider = new SearchProvider(workerPath);
+  context.subscriptions.push({ dispose: () => searchProvider.dispose() });
   const injectDir = getInjectDir();
 
   // Check if patch needs to be re-applied (after VS Code update)

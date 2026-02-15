@@ -24,6 +24,7 @@
     selectedIndex: 0,
     fileCount: 0,
     totalHits: 0,
+    truncated: false,
     previewCache: {},
     searchRequestId: 0,
   };
@@ -660,6 +661,7 @@
       state.results = response.results || [];
       state.fileCount = response.fileCount || 0;
       state.totalHits = response.totalHits || 0;
+      state.truncated = response.truncated || false;
       state.selectedIndex = 0;
       state.previewCache = {};
 
@@ -735,8 +737,10 @@
 
   function updateHitCount() {
     if (state.totalHits > 0) {
-      els.hitCount.textContent =
-        state.totalHits + "\u4EF6 / " + state.fileCount + "\u30D5\u30A1\u30A4\u30EB";
+      var countText = state.truncated
+        ? state.results.length + "+ / " + state.fileCount + "+\u30D5\u30A1\u30A4\u30EB"
+        : state.totalHits + "\u4EF6 / " + state.fileCount + "\u30D5\u30A1\u30A4\u30EB";
+      els.hitCount.textContent = countText;
     } else {
       els.hitCount.textContent = "";
     }

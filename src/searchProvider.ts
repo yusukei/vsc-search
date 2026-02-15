@@ -1,21 +1,83 @@
 import * as vscode from "vscode";
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
+import { Worker } from "worker_threads";
 import {
   SearchParams,
-  SearchResult,
   SearchResponse,
   FileContentResponse,
+  WorkerToMainMessage,
 } from "./types";
 
+const WORKER_TIMEOUT_MS = 30_000;
+
 export class SearchProvider {
+  private worker: Worker;
+  private workerPath: string;
+  private searchId = 0;
+  private currentCts: vscode.CancellationTokenSource | null = null;
+  private pendingSearch: {
+    searchId: number;
+    resolve: (resp: SearchResponse) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  } | null = null;
+
+  constructor(workerPath: string) {
+    this.workerPath = workerPath;
+    this.worker = this.spawnWorker();
+  }
+
+  private spawnWorker(): Worker {
+    console.log("[vsc-search] Spawning worker:", this.workerPath);
+    const w = new Worker(this.workerPath);
+    w.on("online", () => {
+      console.log("[vsc-search] Worker online");
+    });
+    w.on("message", (msg: WorkerToMainMessage) => this.onWorkerMessage(msg));
+    w.on("error", (err) => {
+      console.error("[vsc-search] Worker error:", err);
+    });
+    w.on("exit", (code) => {
+      console.error(
+        `[vsc-search] Worker exited with code ${code}, restarting...`
+      );
+      if (this.pendingSearch) {
+        clearTimeout(this.pendingSearch.timeout);
+        this.pendingSearch.resolve({
+          results: [],
+          fileCount: 0,
+          totalHits: 0,
+          searchTimeMs: 0,
+        });
+        this.pendingSearch = null;
+      }
+      this.worker = this.spawnWorker();
+    });
+    return w;
+  }
+
   async search(params: SearchParams): Promise<SearchResponse> {
     const startTime = Date.now();
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder || !params.query) {
-      return { results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0 };
+      return { results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0, truncated: false };
     }
 
+    // Cancel any in-flight findFiles
+    if (this.currentCts) {
+      this.currentCts.cancel();
+      this.currentCts.dispose();
+      this.currentCts = null;
+    }
+
+    // Cancel any pending worker search
+    this.cancelCurrentSearch();
+
+    const searchId = ++this.searchId;
+    const cts = new vscode.CancellationTokenSource();
+    this.currentCts = cts;
+
+    // findFiles on main thread
     const searchDir = params.directory || "";
     const globPattern = new vscode.RelativePattern(
       workspaceFolder,
@@ -29,7 +91,6 @@ export class SearchProvider {
       "**/build/**",
       "**/.DS_Store",
     ];
-    // If the user explicitly targets an excluded directory, remove that exclusion
     const excludes = searchDir
       ? defaultExcludes.filter((pattern) => {
           const dir = pattern.replace(/^\*\*\//, "").replace(/\/\*\*$/, "");
@@ -39,63 +100,117 @@ export class SearchProvider {
     const excludePattern =
       excludes.length > 0 ? `{${excludes.join(",")}}` : undefined;
 
-    console.log(`[vsc-search] search: query="${params.query}", dir="${searchDir}", glob="${searchDir ? `${searchDir}/**/*` : "**/*"}", exclude=${excludePattern}`);
-
-    const uris = await vscode.workspace.findFiles(globPattern, excludePattern);
-    console.log(`[vsc-search] findFiles returned ${uris.length} URIs`);
-
-    const regex = this.buildRegex(params);
-    if (!regex) {
-      console.log("[vsc-search] regex build failed");
-      return { results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0 };
+    let uris: vscode.Uri[];
+    try {
+      uris = await vscode.workspace.findFiles(
+        globPattern,
+        excludePattern,
+        undefined,
+        cts.token
+      );
+    } catch {
+      cts.dispose();
+      this.currentCts = null;
+      return { results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0, truncated: false };
     }
 
-    const results: SearchResult[] = [];
-    const matchingFiles = new Set<string>();
+    // Check if superseded during findFiles
+    if (this.searchId !== searchId) {
+      cts.dispose();
+      return { results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0, truncated: false };
+    }
 
-    await Promise.all(
-      uris.map(async (uri) => {
-        try {
-          const content = await fs.readFile(uri.fsPath, "utf-8");
-          // Skip likely binary files
-          if (content.includes("\0")) {
-            return;
-          }
-          const relativePath = vscode.workspace.asRelativePath(uri);
-          const fileName = path.basename(uri.fsPath);
-          const lines = content.split("\n");
+    this.currentCts = null;
+    cts.dispose();
 
-          for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            regex.lastIndex = 0;
-            const match = regex.exec(line);
-            if (match) {
-              matchingFiles.add(relativePath);
-              results.push({
-                filePath: relativePath,
-                fileName,
-                lineNumber: i + 1,
-                lineContent: line,
-                column: match.index,
-              });
-            }
-          }
-        } catch {
-          // Skip files that can't be read
+    const filePaths = uris.map((u) => u.fsPath);
+    const relativePaths = uris.map((u) => vscode.workspace.asRelativePath(u));
+
+    console.log(
+      `[vsc-search] findFiles returned ${uris.length} URIs, posting to worker (searchId=${searchId})`
+    );
+
+    // Post to worker and await result (with timeout)
+    return new Promise<SearchResponse>((resolve) => {
+      const wrappedResolve = (resp: SearchResponse) => {
+        resolve({ ...resp, searchTimeMs: Date.now() - startTime });
+      };
+
+      const timeout = setTimeout(() => {
+        console.error("[vsc-search] Worker search timed out");
+        if (this.pendingSearch?.searchId === searchId) {
+          this.worker.postMessage({ type: "abort", searchId });
+          this.pendingSearch = null;
+          wrappedResolve({
+            results: [],
+            fileCount: 0,
+            totalHits: 0,
+            searchTimeMs: 0,
+          });
         }
-      })
-    );
+      }, WORKER_TIMEOUT_MS);
 
-    results.sort(
-      (a, b) => a.filePath.localeCompare(b.filePath) || a.lineNumber - b.lineNumber
-    );
+      this.pendingSearch = { searchId, resolve: wrappedResolve, timeout };
 
-    return {
-      results,
-      fileCount: matchingFiles.size,
-      totalHits: results.length,
-      searchTimeMs: Date.now() - startTime,
-    };
+      this.worker.postMessage({
+        type: "search",
+        searchId,
+        filePaths,
+        relativePaths,
+        params,
+      });
+    });
+  }
+
+  private cancelCurrentSearch(): void {
+    if (this.pendingSearch) {
+      const { searchId, resolve, timeout } = this.pendingSearch;
+      clearTimeout(timeout);
+      this.worker.postMessage({ type: "abort", searchId });
+      resolve({ results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0, truncated: false });
+      this.pendingSearch = null;
+    }
+  }
+
+  private onWorkerMessage(msg: WorkerToMainMessage): void {
+    console.log(
+      `[vsc-search] Worker message: type=${msg.type}, searchId=${msg.searchId}, pending=${this.pendingSearch?.searchId}`
+    );
+    if (!this.pendingSearch) return;
+    if (msg.searchId !== this.pendingSearch.searchId) return;
+
+    const { resolve, timeout } = this.pendingSearch;
+    this.pendingSearch = null;
+    clearTimeout(timeout);
+
+    switch (msg.type) {
+      case "result":
+        resolve({
+          results: msg.results,
+          fileCount: msg.fileCount,
+          totalHits: msg.totalHits,
+          searchTimeMs: 0,
+          truncated: msg.truncated,
+        });
+        break;
+      case "aborted":
+        resolve({ results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0, truncated: false });
+        break;
+      case "error":
+        console.error("[vsc-search] Worker search error:", msg.message);
+        resolve({ results: [], fileCount: 0, totalHits: 0, searchTimeMs: 0, truncated: false });
+        break;
+    }
+  }
+
+  dispose(): void {
+    if (this.currentCts) {
+      this.currentCts.cancel();
+      this.currentCts.dispose();
+      this.currentCts = null;
+    }
+    this.cancelCurrentSearch();
+    this.worker.terminate();
   }
 
   async getFileContent(filePath: string): Promise<FileContentResponse> {
@@ -110,24 +225,6 @@ export class SearchProvider {
     const languageId = this.getLanguageId(ext);
 
     return { content, languageId };
-  }
-
-  private buildRegex(params: SearchParams): RegExp | null {
-    try {
-      let pattern: string;
-      if (params.useRegex) {
-        pattern = params.query;
-      } else {
-        pattern = params.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      }
-      if (params.wholeWord) {
-        pattern = `\\b${pattern}\\b`;
-      }
-      const flags = params.caseSensitive ? "g" : "gi";
-      return new RegExp(pattern, flags);
-    } catch {
-      return null;
-    }
   }
 
   private getLanguageId(ext: string): string {

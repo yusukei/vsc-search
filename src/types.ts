@@ -19,9 +19,52 @@ export interface SearchResponse {
   fileCount: number;
   totalHits: number;
   searchTimeMs: number;
+  truncated: boolean;
 }
 
 export interface FileContentResponse {
   content: string;
   languageId: string;
 }
+
+// --- Worker Thread message types ---
+
+export interface WorkerSearchRequest {
+  type: "search";
+  searchId: number;
+  filePaths: string[];
+  relativePaths: string[];
+  params: SearchParams;
+}
+
+export interface WorkerAbortRequest {
+  type: "abort";
+  searchId: number;
+}
+
+export type MainToWorkerMessage = WorkerSearchRequest | WorkerAbortRequest;
+
+export interface WorkerSearchResult {
+  type: "result";
+  searchId: number;
+  results: SearchResult[];
+  fileCount: number;
+  totalHits: number;
+  truncated: boolean;
+}
+
+export interface WorkerSearchAborted {
+  type: "aborted";
+  searchId: number;
+}
+
+export interface WorkerSearchError {
+  type: "error";
+  searchId: number;
+  message: string;
+}
+
+export type WorkerToMainMessage =
+  | WorkerSearchResult
+  | WorkerSearchAborted
+  | WorkerSearchError;
