@@ -1,12 +1,127 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import { install, uninstall, isPatchInstalled, needsRepatch } from "./patcher";
 import { SearchProvider } from "./searchProvider";
-import { HttpBridge } from "./wsServer";
+import { WsBridge } from "./wsServer";
 
-let bridge: HttpBridge | null = null;
+let bridge: WsBridge | null = null;
+let nonceStatusBarItem: vscode.StatusBarItem | null = null;
+
+// --- Inject directory discovery (same logic as patcher) ---
+
+function findWorkbenchHtml(): string | null {
+  const candidates = [
+    "vs/code/electron-sandbox/workbench/workbench.html",
+    "vs/code/electron-browser/workbench/workbench.html",
+  ];
+  const dirs: string[] = [];
+  const mainFilename = require.main?.filename ?? "";
+  if (mainFilename) {
+    let dir = path.dirname(mainFilename);
+    for (let i = 0; i < 5; i++) {
+      if (fs.existsSync(path.join(dir, "vs"))) {
+        dirs.push(dir);
+        break;
+      }
+      dir = path.dirname(dir);
+    }
+  }
+  const appRoot = vscode.env.appRoot;
+  if (appRoot) {
+    dirs.push(appRoot);
+    dirs.push(path.join(appRoot, "out"));
+  }
+  for (const base of dirs) {
+    for (const c of candidates) {
+      const full = path.join(base, c);
+      if (fs.existsSync(full)) return full;
+    }
+  }
+  return null;
+}
+
+function getInjectDir(): string | null {
+  const htmlPath = findWorkbenchHtml();
+  if (!htmlPath) return null;
+  return path.join(path.dirname(htmlPath), "vsc-search");
+}
+
+// --- bridges.json management ---
+
+interface BridgeEntry {
+  nonce: string;
+  port: number;
+  pid: number;
+  timestamp: number;
+}
+
+function readBridgesJson(injectDir: string): BridgeEntry[] {
+  const filePath = path.join(injectDir, "bridges.json");
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const entries = JSON.parse(raw);
+    if (Array.isArray(entries)) return entries;
+  } catch {}
+  return [];
+}
+
+function writeBridgesJson(injectDir: string, entries: BridgeEntry[]): void {
+  const filePath = path.join(injectDir, "bridges.json");
+  fs.mkdirSync(injectDir, { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(entries, null, 2), "utf-8");
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function registerBridge(injectDir: string, nonce: string, port: number): void {
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+  let entries = readBridgesJson(injectDir);
+
+  // Remove stale entries
+  entries = entries.filter((e) => {
+    if (e.pid === process.pid) return false; // Remove own previous entry
+    if (now - e.timestamp > maxAge) return false; // Too old
+    if (!isProcessAlive(e.pid)) return false; // Dead process
+    return true;
+  });
+
+  // Add own entry
+  entries.push({ nonce, port, pid: process.pid, timestamp: now });
+  writeBridgesJson(injectDir, entries);
+}
+
+function unregisterBridge(injectDir: string): void {
+  let entries = readBridgesJson(injectDir);
+  entries = entries.filter((e) => e.pid !== process.pid);
+  writeBridgesJson(injectDir, entries);
+}
+
+function writeFastPathJson(injectDir: string, windowId: number, port: number): void {
+  const filePath = path.join(injectDir, `bridge-w${windowId}.json`);
+  fs.writeFileSync(filePath, JSON.stringify({ port }), "utf-8");
+}
+
+function removeFastPathJson(injectDir: string, windowId: number): void {
+  const filePath = path.join(injectDir, `bridge-w${windowId}.json`);
+  try {
+    fs.unlinkSync(filePath);
+  } catch {}
+}
+
+// --- Activation ---
 
 export function activate(context: vscode.ExtensionContext) {
   const searchProvider = new SearchProvider();
+  const injectDir = getInjectDir();
 
   // Check if patch needs to be re-applied (after VS Code update)
   if (needsRepatch()) {
@@ -22,9 +137,22 @@ export function activate(context: vscode.ExtensionContext) {
       });
   }
 
-  // --- HTTP bridge ---
+  // --- Nonce for status bar DOM verification ---
+  const nonce = Math.random().toString(36).slice(2, 10);
+  nonceStatusBarItem = vscode.window.createStatusBarItem(
+    "vsc-search-verify",
+    vscode.StatusBarAlignment.Right,
+    -9999
+  );
+  nonceStatusBarItem.text = `vsc-s:${nonce}`;
+  nonceStatusBarItem.name = "vsc-search-verify";
+  nonceStatusBarItem.tooltip = "vsc-search bridge verification";
+  nonceStatusBarItem.show();
+  context.subscriptions.push(nonceStatusBarItem);
 
-  bridge = new HttpBridge(async (method, params) => {
+  // --- WebSocket bridge ---
+
+  bridge = new WsBridge(async (method, params) => {
     const p = params as Record<string, unknown>;
     switch (method) {
       case "search":
@@ -76,15 +204,22 @@ export function activate(context: vscode.ExtensionContext) {
       default:
         throw new Error("Unknown method: " + method);
     }
-  });
+  }, nonce);
 
   bridge
     .start()
     .then((port) => {
       console.log("[vsc-search] Bridge started on port " + port);
-      vscode.window.showInformationMessage(
-        "vsc-search: ブリッジ起動 (port " + port + ")"
-      );
+
+      // Write bridges.json for renderer discovery
+      if (injectDir) {
+        try {
+          registerBridge(injectDir, nonce, port);
+          console.log("[vsc-search] Registered in bridges.json");
+        } catch (e) {
+          console.error("[vsc-search] Failed to write bridges.json:", e);
+        }
+      }
     })
     .catch((e) => {
       const msg = e instanceof Error ? e.message : String(e);
@@ -92,8 +227,43 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.window.showErrorMessage("vsc-search: ブリッジ起動失敗: " + msg);
     });
 
+  // When client verifies, write fast-path json and hide nonce
+  const checkVerified = setInterval(() => {
+    if (bridge?.isConnected && bridge.windowId != null) {
+      clearInterval(checkVerified);
+
+      // Write fast-path json for quick reconnection
+      if (injectDir) {
+        try {
+          writeFastPathJson(injectDir, bridge.windowId, bridge.listeningPort);
+        } catch {}
+      }
+
+      // Hide nonce from status bar
+      if (nonceStatusBarItem) {
+        nonceStatusBarItem.hide();
+      }
+
+      console.log(`[vsc-search] Connection verified (windowId=${bridge.windowId})`);
+    }
+  }, 500);
+
   context.subscriptions.push({
     dispose: () => {
+      clearInterval(checkVerified);
+
+      // Clean up fast-path json
+      if (injectDir && bridge?.windowId != null) {
+        removeFastPathJson(injectDir, bridge.windowId);
+      }
+
+      // Unregister from bridges.json
+      if (injectDir) {
+        try {
+          unregisterBridge(injectDir);
+        } catch {}
+      }
+
       bridge?.stop();
       bridge = null;
     },

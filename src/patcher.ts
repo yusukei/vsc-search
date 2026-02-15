@@ -208,11 +208,25 @@ function copyInjectedFiles(extensionPath: string, htmlPath: string): void {
 }
 
 function patchCSP(content: string): string {
-  if (content.includes("http://127.0.0.1:*")) return content;
-  return content.replace(
-    /(connect-src\s+[^;]*)/,
-    "$1 http://127.0.0.1:*"
-  );
+  let result = content;
+
+  // Add http://127.0.0.1:* if not present
+  if (!result.includes("http://127.0.0.1:*")) {
+    result = result.replace(
+      /(connect-src\s+[^;]*)/,
+      "$1 http://127.0.0.1:*"
+    );
+  }
+
+  // Add ws://127.0.0.1:* if not present
+  if (!result.includes("ws://127.0.0.1:*")) {
+    result = result.replace(
+      /(connect-src\s+[^;]*)/,
+      "$1 ws://127.0.0.1:*"
+    );
+  }
+
+  return result;
 }
 
 function escapeRegExp(s: string): string {

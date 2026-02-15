@@ -1,6 +1,6 @@
 // vsc-search: Injected modal script
 // Runs in VS Code's Renderer process after workbench.html patch
-// Communicates with the Extension Host via HTTP fetch (long-polling)
+// Communicates with the Extension Host via WebSocket (with DOM nonce verification)
 (function () {
   "use strict";
 
@@ -9,9 +9,11 @@
   // ---------------------------------------------------------------------------
   // State (closure variables — session-scoped)
   // ---------------------------------------------------------------------------
-  var bridgePort = 0;
+  var ws = null;
   var connected = false;
   var rpcId = 0;
+  var rpcCallbacks = {};
+  var windowId = null;
   var state = {
     query: "",
     directory: "",
@@ -30,8 +32,6 @@
   var searchTimer = null;
   var DEBOUNCE_MS = 300;
   var PREVIEW_CTX = 8;
-  var PORT_START = 18510;
-  var PORT_END = 18519;
 
   // ---------------------------------------------------------------------------
   // Trusted Types safe DOM helpers
@@ -77,83 +77,326 @@
   }
 
   // ---------------------------------------------------------------------------
-  // HTTP Communication Bridge
+  // Window ID discovery
   // ---------------------------------------------------------------------------
 
-  function baseUrl() {
-    return "http://127.0.0.1:" + bridgePort;
+  function getWindowId() {
+    try {
+      if (window.vscode && window.vscode.context && window.vscode.context.configuration) {
+        var config = window.vscode.context.configuration();
+        if (config && config.windowId != null) {
+          return config.windowId;
+        }
+      }
+    } catch (e) {
+      console.warn("[vsc-search] Failed to get windowId:", e);
+    }
+    return null;
   }
 
-  function tryConnect() {
-    tryPortSequential(PORT_START);
-  }
+  // ---------------------------------------------------------------------------
+  // DOM nonce verification
+  // ---------------------------------------------------------------------------
 
-  function tryPortSequential(port) {
-    if (port > PORT_END) {
-      console.log("[vsc-search] no bridge found, retrying in 3s...");
-      setTimeout(function () {
-        tryPortSequential(PORT_START);
-      }, 3000);
-      return;
+  function findNonceInDom(nonce) {
+    var searchText = "vsc-s:" + nonce;
+
+    // Strategy 1: querySelector for status bar items
+    var items = document.querySelectorAll(
+      ".statusbar-item, .statusbar-entry, [class*='statusbar']"
+    );
+    for (var i = 0; i < items.length; i++) {
+      var text = items[i].textContent || "";
+      if (text.indexOf(searchText) >= 0) {
+        return true;
+      }
     }
 
-    fetch("http://127.0.0.1:" + port + "/", { method: "GET" })
+    // Strategy 2: broader search in status bar footer
+    var footer = document.querySelector(
+      ".part.statusbar, #workbench\\.parts\\.statusbar, footer"
+    );
+    if (footer) {
+      var fullText = footer.textContent || "";
+      if (fullText.indexOf(searchText) >= 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // WebSocket Connection with DOM Verification
+  // ---------------------------------------------------------------------------
+
+  function tryConnect() {
+    windowId = getWindowId();
+    console.log("[vsc-search] windowId =", windowId);
+
+    // Try fast-path first (reconnection via bridge-w{id}.json)
+    if (windowId != null) {
+      tryFastPath();
+    } else {
+      // windowId not yet available, wait and retry
+      setTimeout(tryConnect, 1000);
+    }
+  }
+
+  function tryFastPath() {
+    fetch("vsc-search/bridge-w" + windowId + ".json")
       .then(function (resp) {
+        if (!resp.ok) throw new Error("not found");
         return resp.json();
       })
       .then(function (data) {
-        if (data && data.status === "ok") {
-          bridgePort = port;
-          connected = true;
-          console.log("[vsc-search] HTTP bridge connected on port " + port);
-          if (!els.modal) {
-            buildDOM();
-          }
-          startPolling();
+        if (data && data.port) {
+          console.log("[vsc-search] Fast path: port " + data.port);
+          connectWebSocket(data.port, true);
         } else {
-          tryPortSequential(port + 1);
+          fullScan();
         }
       })
       .catch(function () {
-        tryPortSequential(port + 1);
+        fullScan();
       });
   }
 
-  // ---------------------------------------------------------------------------
-  // Long-polling for Extension Host -> Renderer notifications
-  // ---------------------------------------------------------------------------
-
-  function startPolling() {
-    doPoll();
+  function fullScan() {
+    fetchBridgesJson(0);
   }
 
-  function doPoll() {
-    if (!connected) return;
-
-    fetch(baseUrl() + "/poll", { method: "GET" })
+  function fetchBridgesJson(attempt) {
+    var maxAttempts = 15; // 30 seconds total (2s interval)
+    fetch("vsc-search/bridges.json")
       .then(function (resp) {
+        if (!resp.ok) throw new Error("not found");
         return resp.json();
       })
-      .then(function (data) {
-        if (data && data.notifications) {
-          for (var i = 0; i < data.notifications.length; i++) {
-            handleNotification(data.notifications[i]);
-          }
+      .then(function (entries) {
+        if (!Array.isArray(entries) || entries.length === 0) {
+          throw new Error("empty");
         }
-        // Immediately start next poll
-        doPoll();
+        // Sort by timestamp descending (newest first)
+        entries.sort(function (a, b) { return b.timestamp - a.timestamp; });
+        tryEntries(entries, 0);
       })
-      .catch(function (err) {
-        console.warn("[vsc-search] poll error:", err.message || err);
-        // Retry after delay
-        setTimeout(doPoll, 3000);
+      .catch(function () {
+        if (attempt < maxAttempts) {
+          setTimeout(function () {
+            fetchBridgesJson(attempt + 1);
+          }, 2000);
+        } else {
+          console.error("[vsc-search] bridges.json not available after " + maxAttempts + " attempts");
+        }
       });
   }
 
-  function handleNotification(msg) {
-    if (msg.method === "showModal") {
-      showModal(msg.params);
-    } else if (msg.method === "hideModal") {
+  function tryEntries(entries, index) {
+    if (index >= entries.length) {
+      // All entries exhausted, retry from bridges.json
+      console.log("[vsc-search] No matching bridge found, retrying in 3s...");
+      setTimeout(fullScan, 3000);
+      return;
+    }
+
+    var entry = entries[index];
+    console.log("[vsc-search] Trying port " + entry.port + " (nonce=" + entry.nonce + ")");
+    connectAndVerify(entry.port, entry.nonce, function (success) {
+      if (!success) {
+        tryEntries(entries, index + 1);
+      }
+    });
+  }
+
+  function connectAndVerify(port, expectedNonce, callback) {
+    var socket;
+    try {
+      socket = new WebSocket("ws://127.0.0.1:" + port);
+    } catch (e) {
+      callback(false);
+      return;
+    }
+
+    var verified = false;
+    var timer = setTimeout(function () {
+      if (!verified) {
+        socket.close();
+        callback(false);
+      }
+    }, 5000);
+
+    socket.onopen = function () {
+      console.log("[vsc-search] WebSocket opened on port " + port);
+    };
+
+    socket.onmessage = function (event) {
+      var msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (msg.type === "welcome" && msg.nonce) {
+        // Verify nonce exists in this window's DOM
+        var found = findNonceInDom(msg.nonce);
+        if (found) {
+          verified = true;
+          clearTimeout(timer);
+          console.log("[vsc-search] Nonce verified in DOM: " + msg.nonce);
+
+          // Send verification with windowId
+          socket.send(JSON.stringify({
+            type: "verified",
+            windowId: windowId,
+          }));
+
+          // Connection established
+          onConnected(socket);
+          callback(true);
+        } else {
+          console.log("[vsc-search] Nonce NOT in DOM: " + msg.nonce + " (wrong window)");
+          clearTimeout(timer);
+          socket.close();
+          callback(false);
+        }
+      }
+    };
+
+    socket.onerror = function () {
+      clearTimeout(timer);
+      if (!verified) {
+        callback(false);
+      }
+    };
+
+    socket.onclose = function () {
+      clearTimeout(timer);
+      if (!verified) {
+        callback(false);
+      }
+    };
+  }
+
+  function connectWebSocket(port, isReconnect) {
+    var socket;
+    try {
+      socket = new WebSocket("ws://127.0.0.1:" + port);
+    } catch (e) {
+      if (isReconnect) fullScan();
+      return;
+    }
+
+    var accepted = false;
+
+    socket.onopen = function () {
+      if (isReconnect) {
+        socket.send(JSON.stringify({
+          type: "reconnect",
+          windowId: windowId,
+        }));
+      }
+    };
+
+    socket.onmessage = function (event) {
+      var msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (msg.type === "welcome" && !accepted) {
+        accepted = true;
+        onConnected(socket);
+        return;
+      }
+
+      // If already connected, delegate to message handler
+      if (connected) {
+        handleMessage(msg);
+      }
+    };
+
+    socket.onerror = function () {
+      if (!accepted && isReconnect) {
+        fullScan();
+      }
+    };
+
+    socket.onclose = function () {
+      if (accepted) {
+        onDisconnected();
+      } else if (isReconnect) {
+        fullScan();
+      }
+    };
+  }
+
+  function onConnected(socket) {
+    ws = socket;
+    connected = true;
+    console.log("[vsc-search] WebSocket bridge connected");
+
+    if (!els.modal) {
+      buildDOM();
+    }
+
+    // Set up message handler for future messages
+    socket.onmessage = function (event) {
+      var msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      handleMessage(msg);
+    };
+
+    socket.onclose = function () {
+      onDisconnected();
+    };
+  }
+
+  function onDisconnected() {
+    ws = null;
+    connected = false;
+    rpcCallbacks = {};
+    console.warn("[vsc-search] WebSocket disconnected, reconnecting in 1s...");
+    setTimeout(function () {
+      if (windowId != null) {
+        tryFastPath();
+      } else {
+        fullScan();
+      }
+    }, 1000);
+  }
+
+  function handleMessage(msg) {
+    switch (msg.type) {
+      case "rpc_result":
+        if (rpcCallbacks[msg.id]) {
+          rpcCallbacks[msg.id].resolve(msg.result);
+          delete rpcCallbacks[msg.id];
+        }
+        break;
+      case "rpc_error":
+        if (rpcCallbacks[msg.id]) {
+          rpcCallbacks[msg.id].reject(new Error(msg.error));
+          delete rpcCallbacks[msg.id];
+        }
+        break;
+      case "notify":
+        handleNotification(msg.method, msg.params);
+        break;
+    }
+  }
+
+  function handleNotification(method, params) {
+    if (method === "showModal") {
+      showModal(params);
+    } else if (method === "hideModal") {
       hideModal();
     }
   }
@@ -163,22 +406,19 @@
   // ---------------------------------------------------------------------------
 
   function rpcCall(method, params) {
-    if (!connected) {
+    if (!connected || !ws) {
       return Promise.reject(new Error("Not connected"));
     }
     var id = ++rpcId;
-    return fetch(baseUrl() + "/rpc", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: id, method: method, params: params }),
-    })
-      .then(function (resp) {
-        return resp.json();
-      })
-      .then(function (data) {
-        if (data.error) throw new Error(data.error);
-        return data.result;
-      });
+    return new Promise(function (resolve, reject) {
+      rpcCallbacks[id] = { resolve: resolve, reject: reject };
+      ws.send(JSON.stringify({
+        type: "rpc",
+        id: id,
+        method: method,
+        params: params,
+      }));
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -749,8 +989,9 @@
   );
 
   // ---------------------------------------------------------------------------
-  // Init — connect to Extension Host via HTTP bridge
+  // Init — connect to Extension Host via WebSocket bridge
   // ---------------------------------------------------------------------------
 
-  tryConnect();
+  // Delay initial connection to allow status bar to render
+  setTimeout(tryConnect, 3000);
 })();

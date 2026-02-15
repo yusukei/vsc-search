@@ -730,3 +730,295 @@ Phase 6: ポリッシュ + エッジケース
 | [VS Code Extension API](https://code.visualstudio.com/api) | コマンド登録、ファイル操作、エディタAPI |
 | `vsc-search-spec.md` | 機能仕様書 |
 | `vsc-search-mock.jsx` | UIモック（React実装） |
+
+---
+
+## 8. マルチウィンドウ対応: WebSocket + ステータスバー DOM 検証方式
+
+### 8.1 現状の問題
+
+現在の HTTP ブリッジ（`wsServer.ts`）は**複数ウィンドウ環境で正しく動作しない**。
+
+#### 問題の構造
+
+```
+Window A の Extension Host → port 18510 でサーバー起動
+Window B の Extension Host → port 18511 でサーバー起動
+
+Window A の Renderer → ポート 18510〜18519 を順番にスキャン
+Window B の Renderer → ポート 18510〜18519 を順番にスキャン
+                       ↓
+              両方とも port 18510（Window A）に接続してしまう
+```
+
+| 問題 | 深刻度 | 説明 |
+|------|--------|------|
+| ポートスキャンの誤接続 | 致命的 | Renderer が最初に見つけたサーバーに接続し、別ウィンドウのサーバーに接続する |
+| セッション識別なし | 致命的 | どの Renderer がどの Extension Host に属するか判別不可 |
+| 固定ポート範囲の枯渇 | 高 | 18510-18519 の 10 ポートのみ。11 ウィンドウ以上で起動不可 |
+| long-polling の複雑さ | 中 | `pendingPolls` キュー管理、30 秒タイムアウトなど煩雑 |
+
+### 8.2 検証済み事実
+
+実機検証により以下を確認（2026-02-15）:
+
+| 検証項目 | 結果 | 詳細 |
+|----------|------|------|
+| Renderer: `window.vscode.context.configuration().windowId` | **取得成功** | ウィンドウごとに一意の数値（8, 9, ...） |
+| Renderer: `window.vscodeWindowId` | **undefined** | modal.js 実行時点では未設定 |
+| Extension Host: windowId 取得手段 | **なし** | env vars, `vscode.env` いずれにも windowId がない |
+| Extension Host: `vscode.env.sessionId` | 取得可能 | Extension Host 起動ごとに異なるが、複数ウィンドウ間の一意性は未確認 |
+| inject dir への書き込み（Extension Host） | **成功** | `fs.writeFileSync` でパッチ済みディレクトリに書き込み可 |
+| inject dir からの fetch（Renderer） | **成功** | `fetch('vsc-search/bridges.json')` → status 200 で読み取り可 |
+| ステータスバー nonce の DOM 検索 | **成功** | `.statusbar-item` の `textContent` で nonce を発見可能 |
+
+#### ステータスバーの DOM 構造（検証済み）
+
+```
+FOOTER.part.statusbar                     ← ステータスバー全体
+  └─ DIV.statusbar-item.right             ← アイテムコンテナ（検索対象）
+       └─ A.statusbar-item-label          ← テキスト "vsc-s:{nonce}"
+```
+
+### 8.3 設計: WebSocket + ステータスバー DOM 検証方式
+
+#### 全体アーキテクチャ
+
+```
+┌─ Extension Host ──────────────────────────────────────────────┐
+│ 1. WebSocket サーバーを port 0 で起動（OS が動的に割り当て）     │
+│ 2. nonce（ランダム文字列）を生成                                │
+│ 3. ステータスバーに nonce を表示（`vsc-s:{nonce}`）             │
+│ 4. bridges.json に { port, nonce, pid, timestamp } を追記      │
+│ 5. WebSocket 接続を待ち受け                                    │
+└───────────────────────────────────────────────────────────────┘
+                          ↓ inject dir（ファイル経由）
+┌─ Renderer (modal.js) ────────────────────────────────────────┐
+│ 6. windowId を取得: window.vscode.context.configuration()     │
+│ 7. bridges.json を fetch（リトライ付き）                       │
+│ 8. 各エントリに WebSocket 接続を試行                           │
+│ 9. サーバーから welcome メッセージ（nonce 含む）を受信          │
+│ 10. DOM で .statusbar-item に nonce が存在するか検索            │
+│     → 発見 = 同一ウィンドウ → 接続確定                         │
+│     → 不在 = 別ウィンドウ → 切断して次を試行                   │
+│ 11. 確定後: windowId をサーバーに送信                           │
+│ 12. 以降は WebSocket で双方向通信                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 接続シーケンス（詳細）
+
+```
+Extension Host                    bridges.json              Renderer
+──────────────                    ────────────              ────────
+activate()
+├─ nonce = randomToken()
+├─ statusBar.text = "vsc-s:{nonce}"
+├─ ws = new WebSocketServer(port:0)
+│   → OS assigns port 49152
+├─ write bridges.json ──────────→ [{nonce, port:49152,       config.windowId = 9
+│                                   pid, timestamp}]
+│                                                            fetch('vsc-search/bridges.json')
+│                                                   ←─────── retry if 404
+│                                                            parse entries
+│                                                            for each entry:
+│                                 ws://127.0.0.1:49152 ←───  new WebSocket(port)
+│
+ws.onconnect(client)                                         ws.onopen
+├─ send {type:"welcome",
+│        nonce:"abc123"} ──────────────────────────────────→ receive welcome
+│                                                            DOM search:
+│                                                            querySelector('.statusbar-item')
+│                                                            textContent.includes("vsc-s:abc123")
+│                                                            ├─ FOUND → correct window!
+│                                                            │  send {type:"verified",
+│                                                            │        windowId: 9}
+receive verified ←──────────────────────────────────────────┤
+├─ store windowId = 9                                        │
+├─ write bridge-w9.json                                      │
+│   → {port:49152}                                           │
+├─ statusBar.dispose()                                       │
+│  (nonce をステータスバーから削除)                              │
+│                                                            │
+│  ===== 接続確立 =====                                       │
+│                                                            │
+│                                                            └─ NOT FOUND → wrong window
+│                                                               ws.close()
+│                                                               try next entry
+```
+
+#### 再接続フロー（高速パス）
+
+初回接続成功後、`bridge-w{windowId}.json` が存在するため再接続は高速:
+
+```
+Renderer                                Extension Host
+────────                                ──────────────
+windowId = 9
+fetch('vsc-search/bridge-w9.json')
+├─ found → port = 49152
+│  new WebSocket(port)
+│  send {type:"reconnect", windowId:9}
+│                                        receive reconnect
+│                                        verify windowId matches
+│                              ←──────── send {type:"welcome"}
+│  === 接続確立（DOM検索不要）===
+│
+├─ not found → フルスキャンにフォールバック
+```
+
+### 8.4 bridges.json の管理
+
+#### ファイル形式
+
+```json
+[
+  { "nonce": "abc123", "port": 49152, "pid": 12345, "timestamp": 1771138000000 },
+  { "nonce": "def456", "port": 51234, "pid": 67890, "timestamp": 1771138100000 }
+]
+```
+
+#### 書き込み（Extension Host）
+
+```
+1. bridges.json を読み取り（存在しなければ空配列）
+2. 古いエントリを除去:
+   - 同じ pid のエントリ（自分の前回分）
+   - timestamp が 24 時間以上前のエントリ
+   - pid が生存していないエントリ（process.kill(pid, 0) で確認）
+3. 自分のエントリを追加
+4. JSON で書き込み
+```
+
+#### 読み取り（Renderer）
+
+```
+1. fetch('vsc-search/bridges.json')
+2. 404 の場合は 2 秒後にリトライ（最大 30 秒）
+3. JSON パース（破損行はスキップ）
+4. timestamp が新しい順にソート
+5. 各エントリのポートに WebSocket 接続を試行
+```
+
+#### 配置場所
+
+```
+{workbench.html のディレクトリ}/vsc-search/
+  ├── modal.js           ← パッチャーがコピー（既存）
+  ├── modal.css           ← パッチャーがコピー（既存）
+  ├── highlighter.js      ← パッチャーがコピー（既存）
+  ├── bridges.json        ← Extension Host が動的に書き込み（新規）
+  ├── bridge-w8.json      ← 検証済み接続の高速パス用（新規）
+  └── bridge-w9.json      ← 〃
+```
+
+### 8.5 CSP パッチの更新
+
+現在の `patcher.ts` は HTTP のみ許可している。WebSocket 用に `ws://` を追加:
+
+```typescript
+// 現在（patcher.ts:210-216）
+"$1 http://127.0.0.1:*"
+
+// 変更後
+"$1 http://127.0.0.1:* ws://127.0.0.1:*"
+```
+
+### 8.6 WebSocket プロトコル
+
+#### メッセージ形式（JSON）
+
+```typescript
+// --- 接続確立 ---
+
+// Server → Client: 接続直後に送信
+{ type: "welcome", nonce: string }
+
+// Client → Server: DOM検証成功後
+{ type: "verified", windowId: number }
+
+// Client → Server: 再接続時（bridge-w{id}.json 経由）
+{ type: "reconnect", windowId: number }
+
+// --- RPC（Renderer → Extension Host）---
+
+// Client → Server: リクエスト
+{ type: "rpc", id: number, method: string, params: unknown }
+
+// Server → Client: レスポンス
+{ type: "rpc_result", id: number, result: unknown }
+{ type: "rpc_error", id: number, error: string }
+
+// --- 通知（Extension Host → Renderer）---
+
+// Server → Client: プッシュ通知
+{ type: "notify", method: string, params: unknown }
+```
+
+#### 対応 RPC メソッド（既存と同じ）
+
+| メソッド | 方向 | 用途 |
+|----------|------|------|
+| `search` | Renderer → Host | 検索実行 |
+| `getFileContent` | Renderer → Host | ファイル内容取得 |
+| `openFile` | Renderer → Host | エディタでファイルを開く |
+| `pickFolder` | Renderer → Host | フォルダ選択ダイアログ |
+
+#### 対応通知メソッド（既存と同じ）
+
+| メソッド | 方向 | 用途 |
+|----------|------|------|
+| `showModal` | Host → Renderer | モーダル表示 |
+| `hideModal` | Host → Renderer | モーダル非表示 |
+
+### 8.7 サーバーライフサイクル
+
+```
+activate()
+  ├─ WebSocketServer 起動（port 0）
+  ├─ nonce ステータスバー表示
+  ├─ bridges.json 書き込み
+  └─ context.subscriptions に dispose 登録
+
+deactivate()
+  ├─ WebSocket 全接続クローズ
+  ├─ WebSocketServer 停止
+  ├─ bridges.json から自分のエントリ削除
+  ├─ bridge-w{windowId}.json 削除
+  └─ nonce ステータスバー破棄
+```
+
+### 8.8 エラーハンドリングと再接続
+
+| シナリオ | 対応 |
+|----------|------|
+| bridges.json が存在しない | 2 秒間隔でリトライ（最大 30 秒） |
+| 全ポートへの接続が失敗 | 3 秒後に bridges.json を再読み込みしてリトライ |
+| WebSocket 切断 | 1 秒後に bridge-w{windowId}.json で再接続試行。失敗したらフルスキャン |
+| Extension Host クラッシュ | bridges.json にエントリが残るが、接続試行時に失敗するため自然に除外 |
+| inject dir 書き込み権限エラー | ログ出力のみ。動的ポートは使えないが、既存の固定ポート範囲にフォールバック可能 |
+
+### 8.9 実装対象ファイル
+
+| ファイル | 変更内容 |
+|----------|----------|
+| `src/wsServer.ts` | HTTP ブリッジ → WebSocket サーバーに全面書き換え |
+| `src/extension.ts` | 診断コード削除、nonce ステータスバー表示、bridges.json 管理、deactivate 時のクリーンアップ |
+| `src/patcher.ts` | CSP パッチに `ws://127.0.0.1:*` 追加 |
+| `injected/modal.js` | 診断コード削除、HTTP fetch + long-polling → WebSocket 接続（DOM 検証付き）に全面書き換え |
+| `package.json` | `ws` パッケージを devDependencies に追加（esbuild でバンドル） |
+
+### 8.10 依存パッケージ
+
+| パッケージ | 用途 | 備考 |
+|-----------|------|------|
+| `ws` | Node.js WebSocket サーバー | esbuild でバンドルされるため、実行時依存は不要 |
+
+### 8.11 ステータスバー nonce の UX 考慮
+
+nonce はウィンドウ検証のために一時的に表示される:
+
+- **表示位置**: `StatusBarAlignment.Right`, priority `-9999`（最右端、目立たない位置）
+- **表示期間**: 接続確立後に `dispose()` で削除（通常 3-10 秒）
+- **見た目**: 短い文字列 `vsc-s:xxxxxxxx`（8 文字）
+- **未接続時**: 接続されるまで表示し続ける（接続の手がかりとしても有用）

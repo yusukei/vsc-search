@@ -1,179 +1,160 @@
+import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
-
-const PORT_START = 18510;
-const PORT_END = 18519;
 
 type RequestHandler = (
   method: string,
   params: unknown
 ) => Promise<unknown>;
 
-export class HttpBridge {
-  private server: http.Server | null = null;
-  private handler: RequestHandler;
-  private port = 0;
-  private lastPollTime = 0;
-  private pendingPolls: http.ServerResponse[] = [];
-  private notificationQueue: Array<{ method: string; params?: unknown }> = [];
+interface BridgeClient {
+  ws: WebSocket;
+  windowId: number | null;
+  verified: boolean;
+}
 
-  constructor(handler: RequestHandler) {
+export class WsBridge {
+  private httpServer: http.Server | null = null;
+  private wss: WebSocketServer | null = null;
+  private handler: RequestHandler;
+  private nonce: string;
+  private port = 0;
+  private client: BridgeClient | null = null;
+
+  constructor(handler: RequestHandler, nonce: string) {
     this.handler = handler;
+    this.nonce = nonce;
   }
 
   async start(): Promise<number> {
-    for (let port = PORT_START; port <= PORT_END; port++) {
+    return new Promise((resolve, reject) => {
+      const server = http.createServer();
+      const wss = new WebSocketServer({ server });
+
+      wss.on("connection", (ws) => {
+        this.handleConnection(ws);
+      });
+
+      server.on("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        this.httpServer = server;
+        this.wss = wss;
+        const addr = server.address();
+        if (addr && typeof addr === "object") {
+          this.port = addr.port;
+        }
+        console.log(`[vsc-search] WebSocket bridge listening on port ${this.port}`);
+        resolve(this.port);
+      });
+    });
+  }
+
+  get listeningPort(): number {
+    return this.port;
+  }
+
+  get isConnected(): boolean {
+    return this.client?.verified === true && this.client.ws.readyState === WebSocket.OPEN;
+  }
+
+  get windowId(): number | null {
+    return this.client?.windowId ?? null;
+  }
+
+  private handleConnection(ws: WebSocket): void {
+    // Send welcome with nonce for DOM verification
+    ws.send(JSON.stringify({ type: "welcome", nonce: this.nonce }));
+
+    ws.on("message", (data) => {
+      let msg: Record<string, unknown>;
       try {
-        await this.tryListen(port);
-        this.port = port;
-        console.log(`[vsc-search] HTTP bridge listening on port ${port}`);
-        return port;
+        msg = JSON.parse(data.toString());
       } catch {
-        // Port busy, try next
+        return;
       }
+
+      switch (msg.type) {
+        case "verified":
+          this.onVerified(ws, msg.windowId as number);
+          break;
+        case "reconnect":
+          this.onReconnect(ws, msg.windowId as number);
+          break;
+        case "rpc":
+          this.onRpc(ws, msg);
+          break;
+        default:
+          break;
+      }
+    });
+
+    ws.on("close", () => {
+      if (this.client?.ws === ws) {
+        console.log("[vsc-search] Client disconnected (windowId=" + this.client.windowId + ")");
+        this.client = null;
+      }
+    });
+  }
+
+  private onVerified(ws: WebSocket, windowId: number): void {
+    // Disconnect previous client if any
+    if (this.client && this.client.ws !== ws) {
+      try { this.client.ws.close(); } catch {}
     }
-    throw new Error(
-      "No available port in range " + PORT_START + "-" + PORT_END
+    this.client = { ws, windowId, verified: true };
+    console.log(`[vsc-search] Client verified (windowId=${windowId})`);
+  }
+
+  private onReconnect(ws: WebSocket, windowId: number): void {
+    // Disconnect previous client if any
+    if (this.client && this.client.ws !== ws) {
+      try { this.client.ws.close(); } catch {}
+    }
+    this.client = { ws, windowId, verified: true };
+    // Send welcome to confirm reconnection
+    ws.send(JSON.stringify({ type: "welcome", nonce: this.nonce }));
+    console.log(`[vsc-search] Client reconnected (windowId=${windowId})`);
+  }
+
+  private async onRpc(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const id = msg.id as number;
+    const method = msg.method as string;
+    const params = msg.params;
+
+    try {
+      const result = await this.handler(method, params);
+      ws.send(JSON.stringify({ type: "rpc_result", id, result }));
+    } catch (e) {
+      ws.send(JSON.stringify({
+        type: "rpc_error",
+        id,
+        error: e instanceof Error ? e.message : String(e),
+      }));
+    }
+  }
+
+  /** Send a notification to the connected renderer */
+  notify(method: string, params?: unknown): void {
+    if (!this.client || this.client.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    this.client.ws.send(
+      JSON.stringify({ type: "notify", method, params })
     );
   }
 
-  private tryListen(port: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => {
-        this.handleRequest(req, res);
-      });
-      server.on("error", reject);
-      server.listen(port, "127.0.0.1", () => {
-        server.removeListener("error", reject);
-        this.server = server;
-        resolve();
-      });
-    });
-  }
-
-  private handleRequest(
-    req: http.IncomingMessage,
-    res: http.ServerResponse
-  ): void {
-    // CORS headers for vscode-file:// origin
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    if (req.method === "POST" && req.url === "/rpc") {
-      this.handleRpc(req, res);
-    } else if (req.method === "GET" && req.url === "/poll") {
-      this.handlePoll(req, res);
-    } else if (req.method === "GET") {
-      // Health check / discovery endpoint
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", port: this.port }));
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  }
-
-  private handleRpc(
-    req: http.IncomingMessage,
-    res: http.ServerResponse
-  ): void {
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString();
-    });
-    req.on("end", async () => {
-      let id = 0;
-      try {
-        const msg = JSON.parse(body);
-        id = msg.id || 0;
-        const result = await this.handler(msg.method, msg.params);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id, result }));
-      } catch (e) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            id,
-            error: e instanceof Error ? e.message : String(e),
-          })
-        );
-      }
-    });
-  }
-
-  private handlePoll(
-    _req: http.IncomingMessage,
-    res: http.ServerResponse
-  ): void {
-    this.lastPollTime = Date.now();
-
-    // If there are queued notifications, return immediately
-    if (this.notificationQueue.length > 0) {
-      const notifications = this.notificationQueue.splice(0);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ notifications }));
-      return;
-    }
-
-    // Hold the connection until a notification arrives or timeout
-    this.pendingPolls.push(res);
-
-    const timeout = setTimeout(() => {
-      const idx = this.pendingPolls.indexOf(res);
-      if (idx >= 0) {
-        this.pendingPolls.splice(idx, 1);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ notifications: [] }));
-      }
-    }, 30000);
-
-    _req.on("close", () => {
-      clearTimeout(timeout);
-      const idx = this.pendingPolls.indexOf(res);
-      if (idx >= 0) this.pendingPolls.splice(idx, 1);
-    });
-  }
-
-  /** Send a notification to the renderer via long-poll */
-  notify(method: string, params?: unknown): void {
-    const notification = { method, params };
-
-    // If there are waiting poll requests, respond immediately
-    if (this.pendingPolls.length > 0) {
-      const res = this.pendingPolls.shift()!;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ notifications: [notification] }));
-      return;
-    }
-
-    // Otherwise queue the notification
-    this.notificationQueue.push(notification);
-  }
-
-  /** True if renderer has polled within the last 35 seconds */
-  get isConnected(): boolean {
-    return this.server != null && Date.now() - this.lastPollTime < 35000;
-  }
-
   stop(): void {
-    // Respond to all pending polls
-    for (const res of this.pendingPolls) {
-      try {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ notifications: [] }));
-      } catch {}
+    if (this.client) {
+      try { this.client.ws.close(); } catch {}
+      this.client = null;
     }
-    this.pendingPolls = [];
-
-    if (this.server) {
-      this.server.close();
-      this.server = null;
+    if (this.wss) {
+      this.wss.close();
+      this.wss = null;
+    }
+    if (this.httpServer) {
+      this.httpServer.close();
+      this.httpServer = null;
     }
   }
 }
